@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # and-then-stop-hook.sh - Stop hook for the and-then task queue
-# Detects task completion via <promise> tags and advances to the next task
+# Detects task completion via <done/> tag and advances to the next task
+# Handles both standard tasks and fork (parallel subagent) tasks
 
 set -euo pipefail
 
@@ -78,14 +79,8 @@ if ! [[ "$CURRENT_INDEX" =~ ^[0-9]+$ ]]; then
 fi
 
 # Get current task info
-CURRENT_TASK=$(echo "$TASKS_JSON" | jq -r ".[$CURRENT_INDEX].prompt // empty")
-CURRENT_PROMISE=$(echo "$TASKS_JSON" | jq -r ".[$CURRENT_INDEX].done_when // empty")
-
-if [[ -z "$CURRENT_TASK" ]]; then
-    echo "⚠️  And-then queue: No task at index $CURRENT_INDEX" >&2
-    rm -f "$QUEUE_FILE"
-    exit 0
-fi
+CURRENT_TASK_JSON=$(echo "$TASKS_JSON" | jq -c ".[$CURRENT_INDEX] // {}")
+TASK_TYPE=$(echo "$CURRENT_TASK_JSON" | jq -r '.type // "standard"')
 
 # Extract last assistant message from transcript
 # Transcript is JSONL format (one JSON object per line)
@@ -103,34 +98,48 @@ LAST_OUTPUT=$(tac "$TRANSCRIPT_PATH" 2>/dev/null | while read -r line; do
 done)
 
 if [[ -z "$LAST_OUTPUT" ]]; then
-    # No assistant output found, re-feed current task
     echo "⚠️  And-then queue: No assistant output found" >&2
 fi
 
-# Check for completion promise in output using Perl for multiline matching
-PROMISE_TEXT=""
-if [[ -n "$LAST_OUTPUT" ]]; then
-    PROMISE_TEXT=$(echo "$LAST_OUTPUT" | perl -0777 -pe \
-        's/.*?<promise>(.*?)<\/promise>.*/$1/s; s/^\s+|\s+$//g; s/\s+/ /g' 2>/dev/null || echo "")
-
-    # If perl didn't find a match, the output won't change, so check for the tag
-    if [[ "$PROMISE_TEXT" == "$LAST_OUTPUT" ]] || ! echo "$LAST_OUTPUT" | grep -q '<promise>' 2>/dev/null; then
-        PROMISE_TEXT=""
-    fi
-fi
-
-# Check if promise matches current task's done_when
+# Check for completion signal: <done/> or <done></done>
 TASK_COMPLETE=false
-if [[ -n "$PROMISE_TEXT" ]] && [[ -n "$CURRENT_PROMISE" ]]; then
-    # Normalize whitespace for comparison
-    NORMALIZED_PROMISE=$(echo "$PROMISE_TEXT" | tr -s ' ' | sed 's/^ *//;s/ *$//')
-    NORMALIZED_EXPECTED=$(echo "$CURRENT_PROMISE" | tr -s ' ' | sed 's/^ *//;s/ *$//')
-
-    if [[ "$NORMALIZED_PROMISE" == "$NORMALIZED_EXPECTED" ]]; then
+if [[ -n "$LAST_OUTPUT" ]]; then
+    if echo "$LAST_OUTPUT" | grep -qE '<done\s*/>' 2>/dev/null || \
+       echo "$LAST_OUTPUT" | grep -qE '<done>\s*</done>' 2>/dev/null; then
         TASK_COMPLETE=true
         echo "✅ And-then queue: Task $((CURRENT_INDEX + 1))/$TASK_COUNT complete" >&2
     fi
 fi
+
+# Function to build prompt for a task
+build_task_prompt() {
+    local task_json="$1"
+    local task_type
+    task_type=$(echo "$task_json" | jq -r '.type // "standard"')
+
+    if [[ "$task_type" == "standard" ]]; then
+        echo "$task_json" | jq -r '.prompt // "No task description"'
+    elif [[ "$task_type" == "fork" ]]; then
+        # Build a prompt that instructs Claude to launch parallel subagents
+        local subtasks
+        subtasks=$(echo "$task_json" | jq -r '.subtasks | join("\n- ")')
+        cat << FORK_PROMPT
+Launch the following tasks in PARALLEL using the Task tool. Each subtask should run as a separate subagent concurrently.
+
+Subtasks to run in parallel:
+- $subtasks
+
+IMPORTANT:
+1. Use MULTIPLE Task tool calls in a SINGLE message to run them concurrently
+2. Choose appropriate subagent_type for each task (e.g., "general-purpose", "test-automator", etc.)
+3. Wait for ALL subagents to complete
+4. Summarize the results from each subagent
+5. Output <done/> when ALL subtasks have completed successfully
+FORK_PROMPT
+    else
+        echo "Unknown task type: $task_type"
+    fi
+}
 
 # Determine next action
 if [[ "$TASK_COMPLETE" == true ]]; then
@@ -144,8 +153,9 @@ if [[ "$TASK_COMPLETE" == true ]]; then
     fi
 
     # Get next task info
-    NEXT_TASK=$(echo "$TASKS_JSON" | jq -r ".[$NEXT_INDEX].prompt // empty")
-    NEXT_PROMISE=$(echo "$TASKS_JSON" | jq -r ".[$NEXT_INDEX].done_when // empty")
+    NEXT_TASK_JSON=$(echo "$TASKS_JSON" | jq -c ".[$NEXT_INDEX] // {}")
+    NEXT_TYPE=$(echo "$NEXT_TASK_JSON" | jq -r '.type // "standard"')
+    NEXT_PROMPT=$(build_task_prompt "$NEXT_TASK_JSON")
 
     # Update state file with new index
     TEMP_FILE="${QUEUE_FILE}.tmp.$$"
@@ -161,7 +171,7 @@ data['current_index'] = $NEXT_INDEX
 
 # Rebuild file
 output = '---\n'
-output += yaml.dump(data, default_flow_style=False)
+output += yaml.dump(data, default_flow_style=False, sort_keys=False)
 output += '---\n'
 
 with open('$TEMP_FILE', 'w') as f:
@@ -170,11 +180,15 @@ with open('$TEMP_FILE', 'w') as f:
     mv "$TEMP_FILE" "$QUEUE_FILE"
 
     # Build system message for next task
-    SYSTEM_MSG="📋 Task $((NEXT_INDEX + 1))/$TASK_COUNT | Output <promise>$NEXT_PROMISE</promise> when complete"
+    if [[ "$NEXT_TYPE" == "fork" ]]; then
+        SYSTEM_MSG="🔀 Task $((NEXT_INDEX + 1))/$TASK_COUNT [FORK] | Launch parallel subagents, then <done/> when all complete"
+    else
+        SYSTEM_MSG="📋 Task $((NEXT_INDEX + 1))/$TASK_COUNT | Output <done/> when complete"
+    fi
 
     # Block exit and feed next task
     jq -n \
-        --arg prompt "$NEXT_TASK" \
+        --arg prompt "$NEXT_PROMPT" \
         --arg msg "$SYSTEM_MSG" \
         '{
             "decision": "block",
@@ -183,10 +197,16 @@ with open('$TEMP_FILE', 'w') as f:
         }'
 else
     # Task not complete, re-feed current task
-    SYSTEM_MSG="📋 Task $((CURRENT_INDEX + 1))/$TASK_COUNT | Output <promise>$CURRENT_PROMISE</promise> when complete"
+    CURRENT_PROMPT=$(build_task_prompt "$CURRENT_TASK_JSON")
+
+    if [[ "$TASK_TYPE" == "fork" ]]; then
+        SYSTEM_MSG="🔀 Task $((CURRENT_INDEX + 1))/$TASK_COUNT [FORK] | Launch parallel subagents, then <done/> when all complete"
+    else
+        SYSTEM_MSG="📋 Task $((CURRENT_INDEX + 1))/$TASK_COUNT | Output <done/> when complete"
+    fi
 
     jq -n \
-        --arg prompt "$CURRENT_TASK" \
+        --arg prompt "$CURRENT_PROMPT" \
         --arg msg "$SYSTEM_MSG" \
         '{
             "decision": "block",

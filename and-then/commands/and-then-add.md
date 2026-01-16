@@ -1,33 +1,32 @@
 ---
 name: and-then-add
-description: Add a task to an existing and-then queue
+description: Add tasks to an existing and-then queue
 arguments:
   - name: args
-    description: Task/promise pair using --task and --promise flags
+    description: Tasks using --task and optional --fork flags
     required: true
 allowed_tools:
   - Bash
 ---
 
-# Add Task to And-Then Queue
+# Add Tasks to And-Then Queue
 
-Add a new task to the end of an existing task queue.
+Add more tasks to an existing queue (even while it's running).
 
 ## Usage
 
 ```bash
-/and-then-add --task "New task description" --promise "Completion signal"
+# Add sequential tasks
+/and-then-add --task "New task 1" --task "New task 2"
+
+# Add parallel fork task
+/and-then-add --fork "Subtask A" "Subtask B" "Subtask C"
+
+# Mix both
+/and-then-add --task "Sequential task" --fork "Parallel A" "Parallel B"
 ```
 
-## Notes
-
-- The task is added to the **end** of the queue
-- Can be used while the queue is actively running
-- Requires an existing queue (use `/and-then` to create one first)
-
 ---
-
-**Adding task to queue...**
 
 ```bash
 ${CLAUDE_PLUGIN_ROOT}/scripts/and-then-add.sh $ARGUMENTS

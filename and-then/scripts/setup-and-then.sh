@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # setup-and-then.sh - Creates the and-then task queue state file
-# Usage: setup-and-then.sh --task "task1" --promise "promise1" [--task "task2" --promise "promise2" ...]
+# Usage: setup-and-then.sh --task "task1" [--task "task2"] [--fork "subtask1" "subtask2" ...]
 
 set -euo pipefail
 
@@ -9,45 +9,92 @@ RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[0;33m'
 BLUE='\033[0;34m'
+CYAN='\033[0;36m'
 NC='\033[0m' # No Color
 
 # State file location
 QUEUE_FILE=".claude/and-then-queue.local.md"
 RALPH_FILE=".claude/ralph-loop.local.md"
 
-# Arrays to hold tasks and promises
-declare -a TASKS=()
-declare -a PROMISES=()
+# Array to hold task objects (JSON strings)
+declare -a TASK_OBJECTS=()
+
+# Temporary array for fork subtasks
+declare -a FORK_SUBTASKS=()
+IN_FORK=false
+
+# Function to flush fork subtasks as a task object
+flush_fork() {
+    if [[ ${#FORK_SUBTASKS[@]} -gt 0 ]]; then
+        # Build JSON array of subtasks
+        SUBTASKS_JSON="["
+        for i in "${!FORK_SUBTASKS[@]}"; do
+            [[ $i -gt 0 ]] && SUBTASKS_JSON+=","
+            # Escape quotes and build JSON string
+            ESCAPED="${FORK_SUBTASKS[$i]//\\/\\\\}"
+            ESCAPED="${ESCAPED//\"/\\\"}"
+            SUBTASKS_JSON+="\"$ESCAPED\""
+        done
+        SUBTASKS_JSON+="]"
+
+        TASK_OBJECTS+=("{\"type\":\"fork\",\"subtasks\":$SUBTASKS_JSON}")
+        FORK_SUBTASKS=()
+    fi
+    IN_FORK=false
+}
 
 # Parse arguments
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --task|-t)
+            # Flush any pending fork subtasks
+            flush_fork
+
             if [[ -z "${2:-}" ]]; then
                 echo -e "${RED}Error: --task requires a value${NC}" >&2
                 exit 1
             fi
-            TASKS+=("$2")
+            # Escape quotes for JSON
+            ESCAPED="${2//\\/\\\\}"
+            ESCAPED="${ESCAPED//\"/\\\"}"
+            TASK_OBJECTS+=("{\"type\":\"standard\",\"prompt\":\"$ESCAPED\"}")
             shift 2
             ;;
-        --promise|-p)
-            if [[ -z "${2:-}" ]]; then
-                echo -e "${RED}Error: --promise requires a value${NC}" >&2
+        --fork|-f)
+            # Flush any pending fork subtasks (start new fork group)
+            flush_fork
+            IN_FORK=true
+            shift
+
+            # Collect all following arguments until next flag
+            while [[ $# -gt 0 ]] && [[ ! "$1" =~ ^-- ]]; do
+                FORK_SUBTASKS+=("$1")
+                shift
+            done
+
+            if [[ ${#FORK_SUBTASKS[@]} -eq 0 ]]; then
+                echo -e "${RED}Error: --fork requires at least one subtask${NC}" >&2
                 exit 1
             fi
-            PROMISES+=("$2")
-            shift 2
             ;;
         --help|-h)
-            echo "Usage: setup-and-then.sh --task \"task1\" --promise \"promise1\" [--task \"task2\" --promise \"promise2\" ...]"
+            echo "Usage: setup-and-then.sh --task \"task1\" [--task \"task2\"] [--fork \"sub1\" \"sub2\" ...]"
             echo ""
             echo "Options:"
-            echo "  --task, -t      Task description/prompt"
-            echo "  --promise, -p   Completion promise for the preceding task"
+            echo "  --task, -t      Standard task (executed sequentially)"
+            echo "  --fork, -f      Fork task (subtasks run in parallel via subagents)"
             echo "  --help, -h      Show this help message"
             echo ""
-            echo "Example:"
-            echo "  setup-and-then.sh --task \"Build API\" --promise \"API working\" --task \"Write tests\" --promise \"Tests pass\""
+            echo "Completion: Output <done/> when each task is complete (auto-detected)"
+            echo ""
+            echo "Examples:"
+            echo "  # Sequential tasks"
+            echo "  setup-and-then.sh --task \"Build API\" --task \"Write tests\" --task \"Deploy\""
+            echo ""
+            echo "  # Mix of sequential and parallel tasks"
+            echo "  setup-and-then.sh --task \"Build API\" \\"
+            echo "                    --fork \"Unit tests\" \"Integration tests\" \"E2E tests\" \\"
+            echo "                    --task \"Deploy to staging\""
             exit 0
             ;;
         *)
@@ -58,16 +105,12 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-# Validate we have at least one task
-if [[ ${#TASKS[@]} -eq 0 ]]; then
-    echo -e "${RED}Error: At least one --task is required${NC}" >&2
-    exit 1
-fi
+# Flush any remaining fork subtasks
+flush_fork
 
-# Validate tasks and promises are paired
-if [[ ${#TASKS[@]} -ne ${#PROMISES[@]} ]]; then
-    echo -e "${RED}Error: Each --task must have a corresponding --promise${NC}" >&2
-    echo -e "${RED}  Tasks: ${#TASKS[@]}, Promises: ${#PROMISES[@]}${NC}" >&2
+# Validate we have at least one task
+if [[ ${#TASK_OBJECTS[@]} -eq 0 ]]; then
+    echo -e "${RED}Error: At least one --task or --fork is required${NC}" >&2
     exit 1
 fi
 
@@ -91,40 +134,64 @@ mkdir -p .claude
 # Get current timestamp
 TIMESTAMP=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
 
-# Build YAML tasks array
-YAML_TASKS=""
-for i in "${!TASKS[@]}"; do
-    # Escape quotes in task and promise
-    TASK="${TASKS[$i]//\"/\\\"}"
-    PROMISE="${PROMISES[$i]//\"/\\\"}"
-    YAML_TASKS+="  - prompt: \"$TASK\"
-    done_when: \"$PROMISE\"
-"
+# Build JSON tasks array
+TASKS_JSON="["
+for i in "${!TASK_OBJECTS[@]}"; do
+    [[ $i -gt 0 ]] && TASKS_JSON+=","
+    TASKS_JSON+="${TASK_OBJECTS[$i]}"
 done
+TASKS_JSON+="]"
 
-# Write the state file
-cat > "$QUEUE_FILE" << EOF
----
-active: true
-current_index: 0
-started_at: "$TIMESTAMP"
-tasks:
-$YAML_TASKS---
+# Convert to YAML and write state file using Python
+python3 << EOF
+import json
+import yaml
+
+tasks_json = '''$TASKS_JSON'''
+tasks = json.loads(tasks_json)
+
+data = {
+    'active': True,
+    'current_index': 0,
+    'started_at': '$TIMESTAMP',
+    'tasks': tasks
+}
+
+with open('$QUEUE_FILE', 'w') as f:
+    f.write('---\n')
+    yaml.dump(data, f, default_flow_style=False, sort_keys=False)
+    f.write('---\n')
 EOF
 
 # Display confirmation
-echo -e "${GREEN}✓ And-then queue created with ${#TASKS[@]} task(s)${NC}"
+echo -e "${GREEN}✓ And-then queue created with ${#TASK_OBJECTS[@]} task(s)${NC}"
 echo ""
 echo -e "${BLUE}Tasks:${NC}"
-for i in "${!TASKS[@]}"; do
-    echo -e "  $((i + 1)). ${TASKS[$i]}"
-    echo -e "     ${YELLOW}→ done when: ${PROMISES[$i]}${NC}"
+
+TASK_NUM=1
+for obj in "${TASK_OBJECTS[@]}"; do
+    TYPE=$(echo "$obj" | python3 -c "import sys,json; print(json.load(sys.stdin).get('type',''))")
+
+    if [[ "$TYPE" == "standard" ]]; then
+        PROMPT=$(echo "$obj" | python3 -c "import sys,json; print(json.load(sys.stdin).get('prompt',''))")
+        echo -e "  ${TASK_NUM}. ${PROMPT}"
+    elif [[ "$TYPE" == "fork" ]]; then
+        SUBTASKS=$(echo "$obj" | python3 -c "import sys,json; print('\\n'.join(json.load(sys.stdin).get('subtasks',[])))")
+        echo -e "  ${TASK_NUM}. ${CYAN}[FORK]${NC} Parallel subtasks:"
+        while IFS= read -r subtask; do
+            echo -e "      • ${subtask}"
+        done <<< "$SUBTASKS"
+    fi
+
+    TASK_NUM=$((TASK_NUM + 1))
 done
+
 echo ""
 echo -e "${BLUE}State file:${NC} $QUEUE_FILE"
 echo ""
 echo -e "${YELLOW}⚠️  IMPORTANT:${NC}"
-echo -e "  • Output ${GREEN}<promise>PROMISE_TEXT</promise>${NC} when each task is complete"
+echo -e "  • Output ${GREEN}<done/>${NC} when each task is complete"
+echo -e "  • Fork tasks: Launch parallel subagents, then ${GREEN}<done/>${NC} when all complete"
 echo -e "  • The session will auto-advance to the next task"
 echo -e "  • Use ${BLUE}/and-then-add${NC} to add more tasks"
 echo -e "  • Use ${BLUE}/and-then-cancel${NC} to stop the queue"

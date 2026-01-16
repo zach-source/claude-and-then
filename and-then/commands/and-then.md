@@ -1,9 +1,9 @@
 ---
 name: and-then
-description: Create a sequential task queue that auto-advances when each task completes
+description: Create a sequential task queue with optional parallel fork tasks
 arguments:
   - name: args
-    description: Task/promise pairs using --task and --promise flags
+    description: Tasks using --task and optional --fork flags
     required: true
 allowed_tools:
   - Bash
@@ -11,32 +11,41 @@ allowed_tools:
 
 # And-Then Task Queue
 
-Execute a series of tasks sequentially, automatically advancing to the next task when you complete the current one.
+Execute a series of tasks sequentially, with optional parallel fork tasks. Automatically advances to the next task when you output `<done/>`.
 
 ## Usage
 
 ```bash
-/and-then --task "Task 1 description" --promise "Completion signal 1" \
-          --task "Task 2 description" --promise "Completion signal 2"
+# Sequential tasks
+/and-then --task "Task 1" --task "Task 2" --task "Task 3"
+
+# Mix sequential and parallel tasks
+/and-then --task "Build API" \
+          --fork "Unit tests" "Integration tests" "E2E tests" \
+          --task "Deploy to staging"
 ```
 
-## How It Works
+## Task Types
 
-1. Creates a task queue in `.claude/and-then-queue.local.md`
-2. You work on the current task
-3. When done, output `<promise>COMPLETION_SIGNAL</promise>`
-4. The session automatically advances to the next task
-5. Repeats until all tasks are complete
+### Standard Tasks (`--task`)
+Sequential tasks executed one at a time. Output `<done/>` when complete.
+
+### Fork Tasks (`--fork`)
+Parallel tasks that spawn multiple subagents concurrently. All subtasks run simultaneously, then rejoin before continuing.
+
+```bash
+--fork "Subtask 1" "Subtask 2" "Subtask 3"
+```
 
 ## Signaling Completion
 
-For each task, output the exact promise text in XML tags:
+Simply output `<done/>` when each task is complete:
 
 ```
-<promise>Completion signal 1</promise>
+<done/>
 ```
 
-The promise must match **exactly** (whitespace-normalized) for the task to be marked complete.
+No need to specify custom completion signals - the system auto-detects completion.
 
 ## Managing the Queue
 
@@ -45,12 +54,27 @@ The promise must match **exactly** (whitespace-normalized) for the task to be ma
 - `/and-then-status` - Show current queue status
 - `/and-then-cancel` - Clear the queue and exit
 
-## Example
+## Examples
 
+### Sequential workflow
 ```bash
-/and-then --task "Create a REST API endpoint for users" --promise "API endpoint created" \
-          --task "Write unit tests for the endpoint" --promise "Tests passing" \
-          --task "Update API documentation" --promise "Docs updated"
+/and-then --task "Create database schema" \
+          --task "Build REST API" \
+          --task "Write API documentation"
+```
+
+### Parallel testing then deploy
+```bash
+/and-then --task "Build the application" \
+          --fork "Run unit tests" "Run integration tests" "Run linting" \
+          --task "Deploy to staging"
+```
+
+### Research then implement
+```bash
+/and-then --fork "Research auth libraries" "Review security requirements" \
+          --task "Implement authentication" \
+          --task "Write tests"
 ```
 
 ---
@@ -61,4 +85,6 @@ The promise must match **exactly** (whitespace-normalized) for the task to be ma
 ${CLAUDE_PLUGIN_ROOT}/scripts/setup-and-then.sh $ARGUMENTS
 ```
 
-Once the queue is created, I'll begin working on the first task. When I complete it, I'll output the completion promise and automatically move to the next task.
+Once the queue is created, I'll begin working on the first task. When I complete it, I'll output `<done/>` and automatically move to the next task.
+
+For fork tasks, I'll launch parallel subagents for each subtask, wait for all to complete, then output `<done/>` to advance.

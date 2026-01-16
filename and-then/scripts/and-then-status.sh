@@ -37,19 +37,37 @@ print(f"   Progress: {current + 1}/{total} tasks")
 print()
 
 for i, task in enumerate(tasks):
-    prompt = task.get('prompt', 'No prompt')
-    done_when = task.get('done_when', 'No completion signal')
+    task_type = task.get('type', 'standard')
 
-    if i < current:
-        # Completed
-        print(f"   \033[0;32m✓ {i + 1}. {prompt}\033[0m")
-    elif i == current:
-        # Current
-        print(f"   \033[0;33m→ {i + 1}. {prompt}\033[0m")
-        print(f"      \033[0;36mDone when: {done_when}\033[0m")
-    else:
-        # Pending
-        print(f"   \033[0;90m○ {i + 1}. {prompt}\033[0m")
+    if task_type == 'standard':
+        prompt = task.get('prompt', 'No prompt')
+
+        if i < current:
+            # Completed
+            print(f"   \033[0;32m✓ {i + 1}. {prompt}\033[0m")
+        elif i == current:
+            # Current
+            print(f"   \033[0;33m→ {i + 1}. {prompt}\033[0m")
+            print(f"      \033[0;36mOutput <done/> when complete\033[0m")
+        else:
+            # Pending
+            print(f"   \033[0;90m○ {i + 1}. {prompt}\033[0m")
+
+    elif task_type == 'fork':
+        subtasks = task.get('subtasks', [])
+
+        if i < current:
+            # Completed
+            print(f"   \033[0;32m✓ {i + 1}. [FORK] {len(subtasks)} parallel subtasks\033[0m")
+        elif i == current:
+            # Current
+            print(f"   \033[0;33m→ {i + 1}. \033[0;36m[FORK]\033[0;33m Parallel subtasks:\033[0m")
+            for subtask in subtasks:
+                print(f"      \033[0;33m• {subtask}\033[0m")
+            print(f"      \033[0;36mLaunch all via Task tool, then <done/>\033[0m")
+        else:
+            # Pending
+            print(f"   \033[0;90m○ {i + 1}. [FORK] {len(subtasks)} parallel subtasks\033[0m")
 
 print()
 print(f"\033[0;34mCommands:\033[0m")

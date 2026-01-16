@@ -5,16 +5,24 @@
 
 set -euo pipefail
 
-# State file location
-QUEUE_FILE=".claude/and-then-queue.local.md"
+# Read hook input from stdin
+HOOK_INPUT=$(cat)
+
+# Get working directory from hook input (where Claude session is running)
+SESSION_CWD=$(echo "$HOOK_INPUT" | jq -r '.cwd // empty' 2>/dev/null || echo "")
+
+# Fallback to current directory if not provided
+if [[ -z "$SESSION_CWD" ]]; then
+    SESSION_CWD="$(pwd)"
+fi
+
+# State file location (JSON format, in session's working directory)
+QUEUE_FILE="${SESSION_CWD}/.claude/and-then-queue.json"
 
 # Exit early if no queue is active
 if [[ ! -f "$QUEUE_FILE" ]]; then
     exit 0
 fi
-
-# Read hook input from stdin
-HOOK_INPUT=$(cat)
 
 # Get transcript path from hook input
 TRANSCRIPT_PATH=$(echo "$HOOK_INPUT" | jq -r '.transcript_path // empty' 2>/dev/null || echo "")
@@ -25,36 +33,12 @@ if [[ -z "$TRANSCRIPT_PATH" ]] || [[ ! -f "$TRANSCRIPT_PATH" ]]; then
     exit 0
 fi
 
-# Parse state file using Python (reliable YAML parsing)
-STATE_JSON=$(python3 -c "
-import yaml
-import json
-import sys
+# Parse state file (JSON format - no external dependencies)
+STATE_JSON=$(cat "$QUEUE_FILE" 2>/dev/null || echo '{}')
 
-try:
-    with open('$QUEUE_FILE', 'r') as f:
-        content = f.read()
-
-    # Extract YAML frontmatter between --- markers
-    parts = content.split('---')
-    if len(parts) < 2:
-        print(json.dumps({'error': 'Invalid state file format'}))
-        sys.exit(0)
-
-    data = yaml.safe_load(parts[1])
-    if data is None:
-        print(json.dumps({'error': 'Empty YAML'}))
-        sys.exit(0)
-
-    print(json.dumps(data))
-except Exception as e:
-    print(json.dumps({'error': str(e)}))
-" 2>/dev/null || echo '{"error": "Python parsing failed"}')
-
-# Check for parsing errors
-if echo "$STATE_JSON" | jq -e '.error' >/dev/null 2>&1; then
-    ERROR=$(echo "$STATE_JSON" | jq -r '.error')
-    echo "⚠️  And-then queue: State file error: $ERROR" >&2
+# Validate JSON
+if ! echo "$STATE_JSON" | jq -e '.' >/dev/null 2>&1; then
+    echo "⚠️  And-then queue: Invalid JSON in state file" >&2
     rm -f "$QUEUE_FILE"
     exit 0
 fi
@@ -84,18 +68,21 @@ TASK_TYPE=$(echo "$CURRENT_TASK_JSON" | jq -r '.type // "standard"')
 
 # Extract last assistant message from transcript
 # Transcript is JSONL format (one JSON object per line)
-LAST_OUTPUT=$(tac "$TRANSCRIPT_PATH" 2>/dev/null | while read -r line; do
+LAST_OUTPUT=""
+while IFS= read -r line; do
     ROLE=$(echo "$line" | jq -r '.role // empty' 2>/dev/null || echo "")
     if [[ "$ROLE" == "assistant" ]]; then
         # Extract text content from message
-        echo "$line" | jq -r '
+        TEXT=$(echo "$line" | jq -r '
             .message.content[]? |
             select(.type == "text") |
             .text // empty
-        ' 2>/dev/null | head -1
-        break
+        ' 2>/dev/null | head -1)
+        if [[ -n "$TEXT" ]]; then
+            LAST_OUTPUT="$TEXT"
+        fi
     fi
-done)
+done < <(tac "$TRANSCRIPT_PATH" 2>/dev/null | head -20)
 
 if [[ -z "$LAST_OUTPUT" ]]; then
     echo "⚠️  And-then queue: No assistant output found" >&2
@@ -121,9 +108,27 @@ build_task_prompt() {
         echo "$task_json" | jq -r '.prompt // "No task description"'
     elif [[ "$task_type" == "fork" ]]; then
         # Build a prompt that instructs Claude to launch parallel subagents
-        local subtasks
+        local subtasks workers subtask_count
         subtasks=$(echo "$task_json" | jq -r '.subtasks | join("\n- ")')
-        cat << FORK_PROMPT
+        workers=$(echo "$task_json" | jq -r '.workers // 0')
+        subtask_count=$(echo "$task_json" | jq '.subtasks | length')
+
+        if [[ "$workers" -gt 0 ]] && [[ "$workers" -lt "$subtask_count" ]]; then
+            cat << FORK_PROMPT
+Launch the following tasks using the Task tool with LIMITED CONCURRENCY of $workers workers at a time.
+
+Subtasks to run ($subtask_count total, $workers concurrent):
+- $subtasks
+
+IMPORTANT:
+1. Launch up to $workers Task tool calls at a time (not all at once)
+2. Wait for a batch to complete before starting the next batch
+3. Choose appropriate subagent_type for each task (e.g., "general-purpose", "test-automator", etc.)
+4. Summarize the results from each subagent as they complete
+5. Output <done/> when ALL $subtask_count subtasks have completed successfully
+FORK_PROMPT
+        else
+            cat << FORK_PROMPT
 Launch the following tasks in PARALLEL using the Task tool. Each subtask should run as a separate subagent concurrently.
 
 Subtasks to run in parallel:
@@ -136,8 +141,21 @@ IMPORTANT:
 4. Summarize the results from each subagent
 5. Output <done/> when ALL subtasks have completed successfully
 FORK_PROMPT
+        fi
     else
         echo "Unknown task type: $task_type"
+    fi
+}
+
+# Function to build system message label for fork tasks
+build_fork_label() {
+    local task_json="$1"
+    local workers
+    workers=$(echo "$task_json" | jq -r '.workers // 0')
+    if [[ "$workers" -gt 0 ]]; then
+        echo "[FORK workers=$workers]"
+    else
+        echo "[FORK]"
     fi
 }
 
@@ -157,31 +175,13 @@ if [[ "$TASK_COMPLETE" == true ]]; then
     NEXT_TYPE=$(echo "$NEXT_TASK_JSON" | jq -r '.type // "standard"')
     NEXT_PROMPT=$(build_task_prompt "$NEXT_TASK_JSON")
 
-    # Update state file with new index
-    TEMP_FILE="${QUEUE_FILE}.tmp.$$"
-    python3 -c "
-import yaml
-
-with open('$QUEUE_FILE', 'r') as f:
-    content = f.read()
-
-parts = content.split('---')
-data = yaml.safe_load(parts[1])
-data['current_index'] = $NEXT_INDEX
-
-# Rebuild file
-output = '---\n'
-output += yaml.dump(data, default_flow_style=False, sort_keys=False)
-output += '---\n'
-
-with open('$TEMP_FILE', 'w') as f:
-    f.write(output)
-"
-    mv "$TEMP_FILE" "$QUEUE_FILE"
+    # Update state file with new index (using jq - no external deps)
+    echo "$STATE_JSON" | jq ".current_index = $NEXT_INDEX" > "$QUEUE_FILE"
 
     # Build system message for next task
     if [[ "$NEXT_TYPE" == "fork" ]]; then
-        SYSTEM_MSG="🔀 Task $((NEXT_INDEX + 1))/$TASK_COUNT [FORK] | Launch parallel subagents, then <done/> when all complete"
+        FORK_LABEL=$(build_fork_label "$NEXT_TASK_JSON")
+        SYSTEM_MSG="🔀 Task $((NEXT_INDEX + 1))/$TASK_COUNT $FORK_LABEL | Launch parallel subagents, then <done/> when all complete"
     else
         SYSTEM_MSG="📋 Task $((NEXT_INDEX + 1))/$TASK_COUNT | Output <done/> when complete"
     fi
@@ -200,7 +200,8 @@ else
     CURRENT_PROMPT=$(build_task_prompt "$CURRENT_TASK_JSON")
 
     if [[ "$TASK_TYPE" == "fork" ]]; then
-        SYSTEM_MSG="🔀 Task $((CURRENT_INDEX + 1))/$TASK_COUNT [FORK] | Launch parallel subagents, then <done/> when all complete"
+        FORK_LABEL=$(build_fork_label "$CURRENT_TASK_JSON")
+        SYSTEM_MSG="🔀 Task $((CURRENT_INDEX + 1))/$TASK_COUNT $FORK_LABEL | Launch parallel subagents, then <done/> when all complete"
     else
         SYSTEM_MSG="📋 Task $((CURRENT_INDEX + 1))/$TASK_COUNT | Output <done/> when complete"
     fi

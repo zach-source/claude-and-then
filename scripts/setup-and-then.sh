@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # setup-and-then.sh - Creates the and-then task queue state file
-# Usage: setup-and-then.sh --task "task1" [--task "task2"] [--fork "subtask1" "subtask2" ...]
+# Usage: setup-and-then.sh --task "task1" [--task "task2"] [--fork [--workers N] "subtask1" "subtask2" ...]
 
 set -euo pipefail
 
@@ -12,8 +12,8 @@ BLUE='\033[0;34m'
 CYAN='\033[0;36m'
 NC='\033[0m' # No Color
 
-# State file location
-QUEUE_FILE=".claude/and-then-queue.local.md"
+# State file location (JSON format - no external dependencies)
+QUEUE_FILE=".claude/and-then-queue.json"
 RALPH_FILE=".claude/ralph-loop.local.md"
 
 # Array to hold task objects (JSON strings)
@@ -21,26 +21,25 @@ declare -a TASK_OBJECTS=()
 
 # Temporary array for fork subtasks
 declare -a FORK_SUBTASKS=()
-IN_FORK=false
+
+# Workers count for current fork (0 = unlimited/all at once)
+FORK_WORKERS=0
 
 # Function to flush fork subtasks as a task object
 flush_fork() {
     if [[ ${#FORK_SUBTASKS[@]} -gt 0 ]]; then
-        # Build JSON array of subtasks
-        SUBTASKS_JSON="["
-        for i in "${!FORK_SUBTASKS[@]}"; do
-            [[ $i -gt 0 ]] && SUBTASKS_JSON+=","
-            # Escape quotes and build JSON string
-            ESCAPED="${FORK_SUBTASKS[$i]//\\/\\\\}"
-            ESCAPED="${ESCAPED//\"/\\\"}"
-            SUBTASKS_JSON+="\"$ESCAPED\""
-        done
-        SUBTASKS_JSON+="]"
+        # Build JSON array of subtasks using jq
+        local subtasks_json
+        subtasks_json=$(printf '%s\n' "${FORK_SUBTASKS[@]}" | jq -R -s 'split("\n") | map(select(length > 0))')
 
-        TASK_OBJECTS+=("{\"type\":\"fork\",\"subtasks\":$SUBTASKS_JSON}")
+        if [[ $FORK_WORKERS -gt 0 ]]; then
+            TASK_OBJECTS+=("{\"type\":\"fork\",\"workers\":$FORK_WORKERS,\"subtasks\":$subtasks_json}")
+        else
+            TASK_OBJECTS+=("{\"type\":\"fork\",\"subtasks\":$subtasks_json}")
+        fi
         FORK_SUBTASKS=()
+        FORK_WORKERS=0
     fi
-    IN_FORK=false
 }
 
 # Parse arguments
@@ -54,17 +53,28 @@ while [[ $# -gt 0 ]]; do
                 echo -e "${RED}Error: --task requires a value${NC}" >&2
                 exit 1
             fi
-            # Escape quotes for JSON
-            ESCAPED="${2//\\/\\\\}"
-            ESCAPED="${ESCAPED//\"/\\\"}"
+            # Use jq for proper JSON escaping
+            ESCAPED=$(echo -n "$2" | jq -R -s '.')
+            # Remove surrounding quotes since we'll add them in the JSON object
+            ESCAPED="${ESCAPED:1:-1}"
             TASK_OBJECTS+=("{\"type\":\"standard\",\"prompt\":\"$ESCAPED\"}")
             shift 2
             ;;
         --fork|-f)
             # Flush any pending fork subtasks (start new fork group)
             flush_fork
-            IN_FORK=true
             shift
+
+            # Check for optional --workers flag
+            if [[ "${1:-}" == "--workers" ]] || [[ "${1:-}" == "-w" ]]; then
+                shift
+                if [[ -z "${1:-}" ]] || ! [[ "$1" =~ ^[0-9]+$ ]]; then
+                    echo -e "${RED}Error: --workers requires a numeric value${NC}" >&2
+                    exit 1
+                fi
+                FORK_WORKERS="$1"
+                shift
+            fi
 
             # Collect all following arguments until next flag
             while [[ $# -gt 0 ]] && [[ ! "$1" =~ ^-- ]]; do
@@ -78,12 +88,13 @@ while [[ $# -gt 0 ]]; do
             fi
             ;;
         --help|-h)
-            echo "Usage: setup-and-then.sh --task \"task1\" [--task \"task2\"] [--fork \"sub1\" \"sub2\" ...]"
+            echo "Usage: setup-and-then.sh --task \"task1\" [--task \"task2\"] [--fork [--workers N] \"sub1\" \"sub2\" ...]"
             echo ""
             echo "Options:"
-            echo "  --task, -t      Standard task (executed sequentially)"
-            echo "  --fork, -f      Fork task (subtasks run in parallel via subagents)"
-            echo "  --help, -h      Show this help message"
+            echo "  --task, -t           Standard task (executed sequentially)"
+            echo "  --fork, -f           Fork task (subtasks run in parallel via subagents)"
+            echo "  --workers N, -w N    Limit concurrent workers for fork (default: all at once)"
+            echo "  --help, -h           Show this help message"
             echo ""
             echo "Completion: Output <done/> when each task is complete (auto-detected)"
             echo ""
@@ -91,9 +102,15 @@ while [[ $# -gt 0 ]]; do
             echo "  # Sequential tasks"
             echo "  setup-and-then.sh --task \"Build API\" --task \"Write tests\" --task \"Deploy\""
             echo ""
-            echo "  # Mix of sequential and parallel tasks"
+            echo "  # Parallel tasks (all at once)"
+            echo "  setup-and-then.sh --fork \"Unit tests\" \"Integration tests\" \"E2E tests\""
+            echo ""
+            echo "  # Parallel tasks with limited concurrency (2 at a time)"
+            echo "  setup-and-then.sh --fork --workers 2 \"Task A\" \"Task B\" \"Task C\" \"Task D\""
+            echo ""
+            echo "  # Mix of sequential and parallel"
             echo "  setup-and-then.sh --task \"Build API\" \\"
-            echo "                    --fork \"Unit tests\" \"Integration tests\" \"E2E tests\" \\"
+            echo "                    --fork --workers 3 \"Test 1\" \"Test 2\" \"Test 3\" \"Test 4\" \\"
             echo "                    --task \"Deploy to staging\""
             exit 0
             ;;
@@ -134,7 +151,7 @@ mkdir -p .claude
 # Get current timestamp
 TIMESTAMP=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
 
-# Build JSON tasks array
+# Build tasks array JSON
 TASKS_JSON="["
 for i in "${!TASK_OBJECTS[@]}"; do
     [[ $i -gt 0 ]] && TASKS_JSON+=","
@@ -142,26 +159,16 @@ for i in "${!TASK_OBJECTS[@]}"; do
 done
 TASKS_JSON+="]"
 
-# Convert to YAML and write state file using Python
-python3 << EOF
-import json
-import yaml
-
-tasks_json = '''$TASKS_JSON'''
-tasks = json.loads(tasks_json)
-
-data = {
-    'active': True,
-    'current_index': 0,
-    'started_at': '$TIMESTAMP',
-    'tasks': tasks
-}
-
-with open('$QUEUE_FILE', 'w') as f:
-    f.write('---\n')
-    yaml.dump(data, f, default_flow_style=False, sort_keys=False)
-    f.write('---\n')
-EOF
+# Create state file using jq for proper JSON formatting
+jq -n \
+    --argjson tasks "$TASKS_JSON" \
+    --arg started_at "$TIMESTAMP" \
+    '{
+        active: true,
+        current_index: 0,
+        started_at: $started_at,
+        tasks: $tasks
+    }' > "$QUEUE_FILE"
 
 # Display confirmation
 echo -e "${GREEN}✓ And-then queue created with ${#TASK_OBJECTS[@]} task(s)${NC}"
@@ -170,17 +177,22 @@ echo -e "${BLUE}Tasks:${NC}"
 
 TASK_NUM=1
 for obj in "${TASK_OBJECTS[@]}"; do
-    TYPE=$(echo "$obj" | python3 -c "import sys,json; print(json.load(sys.stdin).get('type',''))")
+    TYPE=$(echo "$obj" | jq -r '.type // "standard"')
 
     if [[ "$TYPE" == "standard" ]]; then
-        PROMPT=$(echo "$obj" | python3 -c "import sys,json; print(json.load(sys.stdin).get('prompt',''))")
+        PROMPT=$(echo "$obj" | jq -r '.prompt // ""')
         echo -e "  ${TASK_NUM}. ${PROMPT}"
     elif [[ "$TYPE" == "fork" ]]; then
-        SUBTASKS=$(echo "$obj" | python3 -c "import sys,json; print('\\n'.join(json.load(sys.stdin).get('subtasks',[])))")
-        echo -e "  ${TASK_NUM}. ${CYAN}[FORK]${NC} Parallel subtasks:"
-        while IFS= read -r subtask; do
+        WORKERS=$(echo "$obj" | jq -r '.workers // 0')
+        SUBTASK_COUNT=$(echo "$obj" | jq '.subtasks | length')
+        if [[ "$WORKERS" -gt 0 ]]; then
+            echo -e "  ${TASK_NUM}. ${CYAN}[FORK workers=${WORKERS}]${NC} ${SUBTASK_COUNT} parallel subtasks:"
+        else
+            echo -e "  ${TASK_NUM}. ${CYAN}[FORK]${NC} ${SUBTASK_COUNT} parallel subtasks:"
+        fi
+        echo "$obj" | jq -r '.subtasks[]' | while read -r subtask; do
             echo -e "      • ${subtask}"
-        done <<< "$SUBTASKS"
+        done
     fi
 
     TASK_NUM=$((TASK_NUM + 1))

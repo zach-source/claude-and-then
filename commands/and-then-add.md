@@ -24,5 +24,5 @@ Add more tasks to an existing queue (even while it's running).
 ---
 
 ```bash
-${CLAUDE_PLUGIN_ROOT}/scripts/and-then-add.sh $ARGUMENTS
+eval ${CLAUDE_PLUGIN_ROOT}/scripts/and-then-add.sh $ARGUMENTS
 ```

@@ -87,7 +87,7 @@ No need to specify custom completion signals - the system auto-detects completio
 **Setting up the task queue...**
 
 ```bash
-${CLAUDE_PLUGIN_ROOT}/scripts/setup-and-then.sh $ARGUMENTS
+eval ${CLAUDE_PLUGIN_ROOT}/scripts/setup-and-then.sh $ARGUMENTS
 ```
 
 Once the queue is created, I'll begin working on the first task. When I complete it, I'll output `<done/>` and automatically move to the next task.

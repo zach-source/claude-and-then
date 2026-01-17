@@ -1,12 +1,7 @@
 ---
-name: and-then
 description: Create a sequential task queue with optional parallel fork tasks
-arguments:
-  - name: args
-    description: Tasks using --task and optional --fork flags
-    required: true
-allowed_tools:
-  - Bash
+argument-hint: --task "Task 1" [--task "Task 2"] [--fork "Sub 1" "Sub 2"] [--fork --workers N ...]
+allowed-tools: [Bash]
 ---
 
 # And-Then Task Queue

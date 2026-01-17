@@ -1,8 +1,6 @@
 ---
-name: and-then-status
 description: Show the current status of the and-then task queue
-allowed_tools:
-  - Bash
+allowed-tools: [Bash]
 ---
 
 # And-Then Queue Status

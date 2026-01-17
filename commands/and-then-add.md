@@ -1,12 +1,7 @@
 ---
-name: and-then-add
 description: Add tasks to an existing and-then queue
-arguments:
-  - name: args
-    description: Tasks using --task and optional --fork flags
-    required: true
-allowed_tools:
-  - Bash
+argument-hint: --task "Task" [--fork "Sub 1" "Sub 2"] [--fork --workers N ...]
+allowed-tools: [Bash]
 ---
 
 # Add Tasks to And-Then Queue

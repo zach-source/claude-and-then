@@ -1,8 +1,6 @@
 ---
-name: and-then-cancel
 description: Cancel the and-then task queue and allow normal session exit
-allowed_tools:
-  - Bash
+allowed-tools: [Bash]
 ---
 
 # Cancel And-Then Queue

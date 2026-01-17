@@ -1,8 +1,6 @@
 ---
-name: and-then-skip
 description: Skip the current task and move to the next one in the queue
-allowed_tools:
-  - Bash
+allowed-tools: [Bash]
 ---
 
 # Skip Current Task

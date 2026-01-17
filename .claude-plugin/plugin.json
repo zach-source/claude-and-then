@@ -7,7 +7,7 @@
     "name": "ztaylor",
     "url": "https://github.com/zach-source"
   },
-  "repository": "https://github.com/zach-source/claude-marketplace",
+  "repository": "https://github.com/zach-source/claude-and-then",
   "license": "MIT",
   "keywords": ["task-queue", "automation", "workflow", "parallel", "fork"],
   "hooks": "./hooks/hooks.json"
